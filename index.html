@@ -183,15 +183,27 @@
                 setupDesktopMode();
             }
             
-            // 使用免費的公共STUN服務器
+            // 使用免費的公共STUN服務器和TURN服務器
             const iceServers = {
                 iceServers: [
                     { urls: 'stun:stun.l.google.com:19302' },
                     { urls: 'stun:stun1.l.google.com:19302' },
                     { urls: 'stun:stun2.l.google.com:19302' },
                     { urls: 'stun:stun3.l.google.com:19302' },
-                    { urls: 'stun:stun4.l.google.com:19302' }
-                ]
+                    { urls: 'stun:stun4.l.google.com:19302' },
+                    // 添加免費的TURN服務器
+                    {
+                        urls: 'turn:openrelay.metered.ca:80',
+                        username: 'openrelayproject',
+                        credential: 'openrelayproject'
+                    },
+                    {
+                        urls: 'turn:openrelay.metered.ca:443',
+                        username: 'openrelayproject',
+                        credential: 'openrelayproject'
+                    }
+                ],
+                iceCandidatePoolSize: 10
             };
             
             // 手機端設定
@@ -348,11 +360,46 @@
                         
                         peer.on('call', (call) => {
                             logDebug('收到來電請求，開始視頻流傳輸');
-                            call.answer(stream);
-                            updateConnectionStatus('connected', '已連接 (傳輸中)');
+                            
+                            // 確保視頻流有效
+                            if (stream && stream.getVideoTracks().length > 0) {
+                                logDebug(`發送視頻軌道: ${stream.getVideoTracks().length}個`);
+                                
+                                // 在回答前先驗證連接狀態
+                                const peerConnection = call.peerConnection;
+                                if (peerConnection) {
+                                    logDebug(`ICE連接狀態: ${peerConnection.iceConnectionState}`);
+                                    logDebug(`信令狀態: ${peerConnection.signalingState}`);
+                                }
+                                
+                                // 回答通話，傳送視頻流
+                                call.answer(stream);
+                                logDebug('已回答通話請求');
+                                updateConnectionStatus('connected', '已連接 (傳輸中)');
+                                
+                                // 監控ICE連接狀態
+                                const iceCheckInterval = setInterval(() => {
+                                    if (call.peerConnection) {
+                                        const state = call.peerConnection.iceConnectionState;
+                                        logDebug(`ICE連接狀態更新: ${state}`);
+                                        
+                                        if (state === 'connected' || state === 'completed') {
+                                            clearInterval(iceCheckInterval);
+                                            logDebug('ICE連接已建立成功');
+                                        } else if (state === 'failed') {
+                                            clearInterval(iceCheckInterval);
+                                            logDebug('ICE連接失敗，請嘗試重新連接');
+                                        }
+                                    }
+                                }, 1000);
+                            } else {
+                                logDebug('錯誤：沒有可用的視頻流進行傳輸');
+                                updateConnectionStatus('disconnected', '沒有視頻流可傳輸');
+                                return;
+                            }
                             
                             call.on('error', (err) => {
-                                logDebug(`通話錯誤: ${err.type}`);
+                                logDebug(`通話錯誤: ${err.type || err}`);
                                 updateConnectionStatus('disconnected', '連接錯誤');
                             });
                             
@@ -469,16 +516,44 @@
                                 
                                 // 呼叫手機端
                                 logDebug('開始呼叫相機端...');
-                                const emptyStream = new MediaStream();
-                                currentCall = peer.call(roomId, emptyStream);
                                 
-                                currentCall.on('stream', (remoteStream) => {
-                                    logDebug('收到遠端視頻流');
-                                    remoteVideo.srcObject = remoteStream;
-                                    joinRoomBtn.disabled = true;
-                                    leaveRoomBtn.disabled = false;
-                                    updateConnectionStatus('connected', '已連接 (接收中)');
-                                });
+                                // 這是關鍵修改：不傳空流，而是改用null
+                                currentCall = peer.call(roomId, null);
+                                
+                                // 添加連接超時處理
+                                const callTimeout = setTimeout(() => {
+                                    if (!remoteVideo.srcObject) {
+                                        logDebug('連接超時，嘗試重新連接...');
+                                        // 嘗試關閉當前呼叫並重新呼叫
+                                        if (currentCall) {
+                                            currentCall.close();
+                                        }
+                                        // 重新發起呼叫
+                                        currentCall = peer.call(roomId, null);
+                                        setupCallListeners();
+                                    }
+                                }, 10000); // 10秒超時
+                                
+                                function setupCallListeners() {
+                                    currentCall.on('stream', (remoteStream) => {
+                                        clearTimeout(callTimeout); // 清除超時
+                                        logDebug('收到遠端視頻流');
+                                        
+                                        // 確保處理流之前，先檢查它是否有視頻軌道
+                                        if (remoteStream && remoteStream.getVideoTracks().length > 0) {
+                                            logDebug(`收到視頻軌道: ${remoteStream.getVideoTracks().length}`);
+                                            remoteVideo.srcObject = remoteStream;
+                                            joinRoomBtn.disabled = true;
+                                            leaveRoomBtn.disabled = false;
+                                            updateConnectionStatus('connected', '已連接 (接收中)');
+                                        } else {
+                                            logDebug('警告：收到的流沒有視頻軌道');
+                                        }
+                                    });
+                                }
+                                
+                                // 設置監聽器
+                                setupCallListeners();
                                 
                                 currentCall.on('error', (err) => {
                                     logDebug(`通話錯誤: ${err}`);
