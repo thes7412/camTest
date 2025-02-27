@@ -1,182 +1,668 @@
-// 手機端（相機端）的修改 - 在startBroadcastBtn事件監聽器中
-
-peer.on('call', (call) => {
-    logDebug('收到來電請求，開始視頻流傳輸');
-    if (!stream || !stream.getVideoTracks().length) {
-        logDebug('錯誤：無可用視頻流');
-        return;
-    }
-    
-    // 重要修改：先檢查視頻軌道是否活躍
-    const videoTrack = stream.getVideoTracks()[0];
-    if (!videoTrack || videoTrack.readyState !== 'live') {
-        logDebug(`警告：視頻軌道狀態異常: ${videoTrack ? videoTrack.readyState : '無軌道'}`);
-        try {
-            // 嘗試重新獲取相機流
-            startCameraBtn.click();
-            setTimeout(() => {
-                // 使用新獲取的流回答通話
-                call.answer(stream);
-                logDebug('已使用重新獲取的流回答通話');
-            }, 1000);
-            return;
-        } catch (err) {
-            logDebug(`重新獲取視頻流失敗: ${err}`);
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>手機相機遠端查看</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 0;
+            padding: 20px;
+            text-align: center;
         }
-    }
-    
-    // 先監控流統計數據，確保可以傳輸
-    setInterval(() => {
-        if (call.peerConnection) {
-            call.peerConnection.getStats(null).then(stats => {
-                let videoSent = false;
-                stats.forEach(report => {
-                    if (report.type === 'outbound-rtp' && report.kind === 'video') {
-                        videoSent = true;
-                        logDebug(`已發送 ${report.bytesSent} 字節視頻數據`);
+        
+        .container {
+            max-width: 800px;
+            margin: 0 auto;
+        }
+        
+        #localVideo, #remoteVideo {
+            width: 100%;
+            max-width: 640px;
+            background-color: #000;
+            border-radius: 8px;
+            margin-top: 20px;
+        }
+        
+        .control-panel {
+            margin-top: 20px;
+        }
+        
+        button {
+            padding: 10px 20px;
+            background-color: #4CAF50;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            margin: 5px;
+            font-size: 16px;
+        }
+        
+        button:hover {
+            background-color: #45a049;
+        }
+        
+        button:disabled {
+            background-color: #cccccc;
+            cursor: not-allowed;
+        }
+        
+        .room-info {
+            margin: 20px 0;
+            padding: 10px;
+            background-color: #f1f1f1;
+            border-radius: 4px;
+        }
+        
+        .device-type {
+            font-weight: bold;
+            margin-bottom: 10px;
+        }
+        
+        #roomId {
+            font-weight: bold;
+            color: #4CAF50;
+        }
+        
+        #errorMsg {
+            color: red;
+            margin-top: 10px;
+        }
+        
+        .connection-status {
+            margin-top: 15px;
+            padding: 8px;
+            border-radius: 4px;
+            font-weight: bold;
+        }
+        
+        .connected { background-color: #d4edda; color: #155724; }
+        .disconnected { background-color: #f8d7da; color: #721c24; }
+        .connecting { background-color: #fff3cd; color: #856404; }
+        
+        #debugInfo {
+            margin-top: 20px;
+            text-align: left;
+            font-size: 12px;
+            color: #666;
+            max-height: 200px;
+            overflow-y: auto;
+        }
+        
+        select {
+            padding: 8px;
+            margin: 5px;
+            border-radius: 4px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>手機相機遠端查看系統</h1>
+        
+        <div class="device-type" id="deviceType">正在檢測裝置類型...</div>
+        <div id="connectionStatus" class="connection-status disconnected">未連接</div>
+        
+        <div id="mobileControls" style="display: none;">
+            <h2>手機端 (攝影機來源)</h2>
+            <div class="room-info">
+                房間ID: <span id="roomId">尚未生成</span>
+                <button id="copyRoomId">複製房間ID</button>
+            </div>
+            <video id="localVideo" autoplay playsinline muted></video>
+            <div class="control-panel">
+                <select id="resolutionSelect">
+                    <option value="480p" selected>480p</option>
+                    <option value="720p">720p</option>
+                    <option value="1080p">1080p</option>
+                </select>
+                <button id="startCamera">開啟相機</button>
+                <button id="stopCamera" disabled>關閉相機</button>
+                <button id="switchCamera">切換相機</button>
+                <button id="startBroadcast" disabled>開始廣播</button>
+                <button id="stopBroadcast" disabled>停止廣播</button>
+            </div>
+        </div>
+        
+        <div id="desktopControls" style="display: none;">
+            <h2>電腦端 (接收端)</h2>
+            <div class="room-info">
+                <input type="text" id="joinRoomId" placeholder="輸入房間ID">
+                <button id="joinRoom">連接到手機</button>
+                <button id="leaveRoom" disabled>斷開連接</button>
+            </div>
+            <video id="remoteVideo" autoplay playsinline></video>
+        </div>
+        
+        <div id="errorMsg"></div>
+        <div id="debugInfo"></div>
+    </div>
+
+    <script src="https://unpkg.com/peerjs@1.4.7/dist/peerjs.min.js"></script>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            // 初始化元素與工具函數
+            const debugInfo = document.getElementById('debugInfo');
+            const connectionStatus = document.getElementById('connectionStatus');
+            const errorMsg = document.getElementById('errorMsg');
+            
+            function logDebug(message) {
+                console.log(message);
+                debugInfo.innerHTML += `<div>${new Date().toLocaleTimeString()}: ${message}</div>`;
+                const logs = debugInfo.querySelectorAll('div');
+                if (logs.length > 20) debugInfo.removeChild(logs[0]);
+                // 自動滾動到底部
+                debugInfo.scrollTop = debugInfo.scrollHeight;
+            }
+            
+            function updateConnectionStatus(status, message) {
+                connectionStatus.textContent = message;
+                connectionStatus.className = 'connection-status ' + status;
+            }
+            
+            // 檢測裝置類型
+            const isMobile = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
+            const deviceTypeEl = document.getElementById('deviceType');
+            const mobileControls = document.getElementById('mobileControls');
+            const desktopControls = document.getElementById('desktopControls');
+            
+            if (isMobile) {
+                deviceTypeEl.textContent = '當前裝置: 手機端 (相機來源)';
+                mobileControls.style.display = 'block';
+                setupMobileMode();
+            } else {
+                deviceTypeEl.textContent = '當前裝置: 電腦端 (接收端)';
+                desktopControls.style.display = 'block';
+                setupDesktopMode();
+            }
+            
+            // ICE 服務器配置
+            const iceServers = {
+                iceServers: [
+                    { urls: 'stun:stun.l.google.com:19302' },
+                    { urls: 'stun:stun1.l.google.com:19302' },
+                    {
+                        urls: 'turn:openrelay.metered.ca:80',
+                        username: 'openrelayproject',
+                        credential: 'openrelayproject'
+                    },
+                    {
+                        urls: 'turn:openrelay.metered.ca:443',
+                        username: 'openrelayproject',
+                        credential: 'openrelayproject'
+                    }
+                ],
+                iceCandidatePoolSize: 10
+            };
+            
+            // 手機端設定
+            function setupMobileMode() {
+                const localVideo = document.getElementById('localVideo');
+                const startCameraBtn = document.getElementById('startCamera');
+                const stopCameraBtn = document.getElementById('stopCamera');
+                const switchCameraBtn = document.getElementById('switchCamera');
+                const startBroadcastBtn = document.getElementById('startBroadcast');
+                const stopBroadcastBtn = document.getElementById('stopBroadcast');
+                const roomIdDisplay = document.getElementById('roomId');
+                const copyRoomIdBtn = document.getElementById('copyRoomId');
+                const resolutionSelect = document.getElementById('resolutionSelect');
+                
+                let stream = null;
+                let peer = null;
+                let currentRoomId = null;
+                let currentCameraFacing = 'user';
+                
+                const resolutions = {
+                    '480p': { width: 640, height: 480 },
+                    '720p': { width: 1280, height: 720 },
+                    '1080p': { width: 1920, height: 1080 }
+                };
+                
+                function updateButtonStates() {
+                    startCameraBtn.disabled = !!stream;
+                    stopCameraBtn.disabled = !stream;
+                    switchCameraBtn.disabled = !stream;
+                    startBroadcastBtn.disabled = !stream || !!peer;
+                    stopBroadcastBtn.disabled = !peer;
+                }
+                
+                startCameraBtn.addEventListener('click', async () => {
+                    try {
+                        const resolution = resolutions[resolutionSelect.value];
+                        const constraints = {
+                            video: {
+                                facingMode: currentCameraFacing,
+                                width: { ideal: resolution.width },
+                                height: { ideal: resolution.height }
+                            },
+                            audio: false
+                        };
+                        
+                        logDebug('請求相機權限...');
+                        stream = await navigator.mediaDevices.getUserMedia(constraints);
+                        localVideo.srcObject = stream;
+                        logDebug('相機已開啟成功');
+                        
+                        currentRoomId = Math.random().toString(36).substring(2, 12);
+                        roomIdDisplay.textContent = currentRoomId;
+                        logDebug(`已生成房間ID: ${currentRoomId}`);
+                        
+                        updateButtonStates();
+                    } catch (err) {
+                        errorMsg.textContent = `攝像頭啟動失敗: ${err.message}。請檢查權限或設備狀態`;
+                        logDebug(`攝像頭啟動失敗: ${err.message}`);
                     }
                 });
-                if (!videoSent) {
-                    logDebug('警告：未檢測到視頻數據傳輸');
-                }
-            });
-        }
-    }, 5000); // 每5秒檢查一次
-    
-    // 回答通話，傳送視頻流
-    call.answer(stream);
-    logDebug(`已回答通話請求，視頻軌道狀態: ${videoTrack.readyState}`);
-    updateConnectionStatus('connected', '已連接 (傳輸中)');
-    
-    // 更詳細的ICE監控
-    call.peerConnection.oniceconnectionstatechange = () => {
-        const state = call.peerConnection.iceConnectionState;
-        logDebug(`ICE狀態變更: ${state}`);
-        if (state === 'failed' || state === 'disconnected') {
-            updateConnectionStatus('disconnected', 'ICE連接失敗');
-        }
-    };
-    
-    // 添加傳輸狀態監控
-    call.peerConnection.onconnectionstatechange = () => {
-        logDebug(`連接狀態變更: ${call.peerConnection.connectionState}`);
-    };
-    
-    call.on('error', (err) => {
-        logDebug(`通話錯誤: ${err}`);
-        updateConnectionStatus('disconnected', '連接錯誤');
-    });
-    
-    call.on('close', () => {
-        logDebug('通話已結束');
-        updateConnectionStatus('connected', '已連接 (等待接收端)');
-    });
-});
-
-// 電腦端（接收端）的修改 - 在joinRoomBtn點擊事件內
-
-peer.on('open', (id) => {
-    logDebug(`已連接到PeerJS服務器，本機ID: ${id}`);
-    
-    // 不使用空流，直接使用null來發起呼叫
-    currentCall = peer.call(roomId, null);
-    logDebug('已發起呼叫請求');
-    
-    const timeout = setTimeout(() => {
-        if (!remoteVideo.srcObject) {
-            logDebug('連接超時，嘗試重新呼叫');
-            if (currentCall) currentCall.close();
-            
-            // 重要修改：使用null代替空的MediaStream
-            currentCall = peer.call(roomId, null);
-            setupCallListeners();
-            
-            // 添加第二次超時處理
-            setTimeout(() => {
-                if (!remoteVideo.srcObject) {
-                    logDebug('第二次嘗試仍未收到視頻流，請檢查手機端是否正確開啟相機和廣播');
-                    errorMsg.textContent = '連接失敗，請確認以下事項：1.手機已點擊"開始廣播" 2.房間ID正確 3.相機權限已允許';
-                }
-            }, 10000);
-        }
-    }, 10000);
-    
-    function setupCallListeners() {
-        currentCall.on('stream', (remoteStream) => {
-            clearTimeout(timeout);
-            logDebug(`收到遠端流: 視頻軌道數=${remoteStream.getVideoTracks().length}, 音頻軌道數=${remoteStream.getAudioTracks().length}`);
-            
-            if (remoteStream.getVideoTracks().length) {
-                const videoTrack = remoteStream.getVideoTracks()[0];
-                logDebug(`視頻軌道狀態: ${videoTrack.readyState}, 已啟用: ${videoTrack.enabled}`);
                 
-                remoteVideo.srcObject = remoteStream;
-                updateConnectionStatus('connected', '已連接 (接收中)');
-                updateButtonStates();
+                stopCameraBtn.addEventListener('click', () => {
+                    if (stream) {
+                        stream.getTracks().forEach(track => track.stop());
+                        stream = null;
+                        localVideo.srcObject = null;
+                        logDebug('相機已關閉');
+                    }
+                    if (peer) {
+                        peer.destroy();
+                        peer = null;
+                        logDebug('PeerJS連接已銷毀');
+                        updateConnectionStatus('disconnected', '未連接');
+                    }
+                    updateButtonStates();
+                });
                 
-                // 監控接收的視頻數據
-                setInterval(() => {
-                    if (currentCall && currentCall.peerConnection) {
-                        currentCall.peerConnection.getStats(null).then(stats => {
-                            let videoReceived = false;
-                            stats.forEach(report => {
-                                if (report.type === 'inbound-rtp' && report.kind === 'video') {
-                                    videoReceived = true;
-                                    logDebug(`已接收 ${report.bytesReceived} 字節視頻數據`);
+                switchCameraBtn.addEventListener('click', async () => {
+                    if (stream) {
+                        stream.getTracks().forEach(track => track.stop());
+                    }
+                    
+                    try {
+                        currentCameraFacing = currentCameraFacing === 'user' ? 'environment' : 'user';
+                        logDebug(`切換相機到: ${currentCameraFacing === 'user' ? '前置' : '後置'}`);
+                        
+                        const resolution = resolutions[resolutionSelect.value];
+                        const constraints = {
+                            video: {
+                                facingMode: currentCameraFacing,
+                                width: { ideal: resolution.width },
+                                height: { ideal: resolution.height }
+                            },
+                            audio: false
+                        };
+                        
+                        stream = await navigator.mediaDevices.getUserMedia(constraints);
+                        localVideo.srcObject = stream;
+                        logDebug('相機切換成功');
+                        
+                        if (peer && peer.connections && Object.keys(peer.connections).length > 0) {
+                            Object.values(peer.connections).forEach(conns => {
+                                conns.forEach(conn => {
+                                    if (conn.peerConnection && conn.peerConnection.signalingState !== 'closed') {
+                                        const senders = conn.peerConnection.getSenders();
+                                        const videoSender = senders.find(s => s.track?.kind === 'video');
+                                        if (videoSender) {
+                                            videoSender.replaceTrack(stream.getVideoTracks()[0]);
+                                            logDebug('已更新遠端視頻流');
+                                        }
+                                    }
+                                });
+                            });
+                        }
+                    } catch (err) {
+                        errorMsg.textContent = `切換相機失敗: ${err.message}。請檢查設備`;
+                        logDebug(`切換相機失敗: ${err.message}`);
+                    }
+                });
+                
+                startBroadcastBtn.addEventListener('click', () => {
+                    if (!stream || !stream.getVideoTracks().length) {
+                        errorMsg.textContent = '視頻流不可用，請重新開啟相機';
+                        logDebug('錯誤：無有效的視頻流');
+                        return;
+                    }
+                    
+                    logDebug('初始化PeerJS連接...');
+                    updateConnectionStatus('connecting', '正在連接...');
+                    
+                    peer = new Peer(currentRoomId, { debug: 2, config: iceServers });
+                    
+                    peer.on('open', (id) => {
+                        logDebug(`已連接到PeerJS服務器，ID: ${id}`);
+                        updateConnectionStatus('connected', '已連接 (等待接收端)');
+                        updateButtonStates();
+                    });
+                    
+                    peer.on('call', (call) => {
+                        logDebug('收到來電請求，開始視頻流傳輸');
+                        if (!stream || !stream.getVideoTracks().length) {
+                            logDebug('錯誤：無可用視頻流');
+                            return;
+                        }
+                        
+                        // 重要修改：先檢查視頻軌道是否活躍
+                        const videoTrack = stream.getVideoTracks()[0];
+                        if (!videoTrack || videoTrack.readyState !== 'live') {
+                            logDebug(`警告：視頻軌道狀態異常: ${videoTrack ? videoTrack.readyState : '無軌道'}`);
+                            try {
+                                // 嘗試重新獲取相機流
+                                startCameraBtn.click();
+                                setTimeout(() => {
+                                    // 使用新獲取的流回答通話
+                                    call.answer(stream);
+                                    logDebug('已使用重新獲取的流回答通話');
+                                }, 1000);
+                                return;
+                            } catch (err) {
+                                logDebug(`重新獲取視頻流失敗: ${err}`);
+                            }
+                        }
+                        
+                        // 先監控流統計數據，確保可以傳輸
+                        const statsInterval = setInterval(() => {
+                            if (call.peerConnection) {
+                                call.peerConnection.getStats(null).then(stats => {
+                                    let videoSent = false;
+                                    stats.forEach(report => {
+                                        if (report.type === 'outbound-rtp' && report.kind === 'video') {
+                                            videoSent = true;
+                                            logDebug(`已發送 ${report.bytesSent} 字節視頻數據`);
+                                        }
+                                    });
+                                    if (!videoSent) {
+                                        logDebug('警告：未檢測到視頻數據傳輸');
+                                    }
+                                }).catch(err => {
+                                    logDebug(`獲取統計數據失敗: ${err}`);
+                                });
+                            } else {
+                                clearInterval(statsInterval);
+                            }
+                        }, 5000); // 每5秒檢查一次
+                        
+                        // 回答通話，傳送視頻流
+                        call.answer(stream);
+                        logDebug(`已回答通話請求，視頻軌道狀態: ${videoTrack.readyState}`);
+                        updateConnectionStatus('connected', '已連接 (傳輸中)');
+                        
+                        // 更詳細的ICE監控
+                        call.peerConnection.oniceconnectionstatechange = () => {
+                            const state = call.peerConnection.iceConnectionState;
+                            logDebug(`ICE狀態變更: ${state}`);
+                            if (state === 'failed' || state === 'disconnected') {
+                                updateConnectionStatus('disconnected', 'ICE連接失敗');
+                            }
+                        };
+                        
+                        // 添加傳輸狀態監控
+                        call.peerConnection.onconnectionstatechange = () => {
+                            logDebug(`連接狀態變更: ${call.peerConnection.connectionState}`);
+                        };
+                        
+                        call.on('error', (err) => {
+                            logDebug(`通話錯誤: ${err}`);
+                            updateConnectionStatus('disconnected', '連接錯誤');
+                            clearInterval(statsInterval);
+                        });
+                        
+                        call.on('close', () => {
+                            logDebug('通話已結束');
+                            updateConnectionStatus('connected', '已連接 (等待接收端)');
+                            clearInterval(statsInterval);
+                        });
+                    });
+                    
+                    peer.on('error', (err) => {
+                        errorMsg.textContent = `連接錯誤: ${err.type}`;
+                        logDebug(`PeerJS錯誤: ${err.type}`);
+                        updateConnectionStatus('disconnected', '連接錯誤');
+                        if (err.type === 'unavailable-id') {
+                            currentRoomId = Math.random().toString(36).substring(2, 12);
+                            roomIdDisplay.textContent = currentRoomId;
+                            logDebug(`ID衝突，已重新生成: ${currentRoomId}`);
+                        }
+                    });
+                    
+                    peer.on('disconnected', () => {
+                        logDebug('與PeerJS服務器斷開，嘗試重連');
+                        updateConnectionStatus('connecting', '正在重連...');
+                        peer.reconnect();
+                    });
+                });
+                
+                stopBroadcastBtn.addEventListener('click', () => {
+                    if (peer) {
+                        peer.destroy();
+                        peer = null;
+                        logDebug('已停止廣播，PeerJS連接已銷毀');
+                    }
+                    updateConnectionStatus('disconnected', '已停止廣播');
+                    updateButtonStates();
+                });
+                
+                copyRoomIdBtn.addEventListener('click', () => {
+                    if (currentRoomId) {
+                        navigator.clipboard.writeText(currentRoomId)
+                            .then(() => {
+                                logDebug('房間ID已複製');
+                                alert('房間ID已複製到剪貼簿');
+                            })
+                            .catch(err => {
+                                logDebug(`複製失敗: ${err.message}`);
+                                alert('複製失敗，請手動複製: ' + currentRoomId);
+                            });
+                    }
+                });
+            }
+            
+            // 電腦端設定
+            function setupDesktopMode() {
+                const joinRoomIdInput = document.getElementById('joinRoomId');
+                const joinRoomBtn = document.getElementById('joinRoom');
+                const leaveRoomBtn = document.getElementById('leaveRoom');
+                const remoteVideo = document.getElementById('remoteVideo');
+                
+                let peer = null;
+                let currentCall = null;
+                let statsInterval = null;
+                
+                function updateButtonStates() {
+                    joinRoomBtn.disabled = !!peer;
+                    leaveRoomBtn.disabled = !peer;
+                }
+                
+                joinRoomBtn.addEventListener('click', () => {
+                    const roomId = joinRoomIdInput.value.trim();
+                    if (!roomId) {
+                        errorMsg.textContent = '請輸入房間ID';
+                        return;
+                    }
+                    
+                    logDebug(`嘗試連接房間ID: ${roomId}`);
+                    updateConnectionStatus('connecting', '正在連接...');
+                    errorMsg.textContent = '';
+                    
+                    peer = new Peer({ debug: 2, config: iceServers });
+                    
+                    peer.on('open', (id) => {
+                        logDebug(`已連接到PeerJS服務器，本機ID: ${id}`);
+                        
+                        // 不使用空流，直接使用null來發起呼叫
+                        currentCall = peer.call(roomId, null);
+                        logDebug('已發起呼叫請求');
+                        
+                        const timeout = setTimeout(() => {
+                            if (!remoteVideo.srcObject) {
+                                logDebug('連接超時，嘗試重新呼叫');
+                                if (currentCall) currentCall.close();
+                                
+                                // 重要修改：使用null代替空的MediaStream
+                                currentCall = peer.call(roomId, null);
+                                setupCallListeners();
+                                
+                                // 添加第二次超時處理
+                                setTimeout(() => {
+                                    if (!remoteVideo.srcObject) {
+                                        logDebug('第二次嘗試仍未收到視頻流，請檢查手機端是否正確開啟相機和廣播');
+                                        errorMsg.textContent = '連接失敗，請確認以下事項：1.手機已點擊"開始廣播" 2.房間ID正確 3.相機權限已允許';
+                                    }
+                                }, 10000);
+                            }
+                        }, 10000);
+                        
+                        function setupCallListeners() {
+                            currentCall.on('stream', (remoteStream) => {
+                                clearTimeout(timeout);
+                                logDebug(`收到遠端流: 視頻軌道數=${remoteStream.getVideoTracks().length}, 音頻軌道數=${remoteStream.getAudioTracks().length}`);
+                                
+                                if (remoteStream.getVideoTracks().length) {
+                                    const videoTrack = remoteStream.getVideoTracks()[0];
+                                    logDebug(`視頻軌道狀態: ${videoTrack.readyState}, 已啟用: ${videoTrack.enabled}`);
+                                    
+                                    remoteVideo.srcObject = remoteStream;
+                                    updateConnectionStatus('connected', '已連接 (接收中)');
+                                    updateButtonStates();
+                                    
+                                    // 監控接收的視頻數據
+                                    if (statsInterval) clearInterval(statsInterval);
+                                    statsInterval = setInterval(() => {
+                                        if (currentCall && currentCall.peerConnection) {
+                                            currentCall.peerConnection.getStats(null).then(stats => {
+                                                let videoReceived = false;
+                                                stats.forEach(report => {
+                                                    if (report.type === 'inbound-rtp' && report.kind === 'video') {
+                                                        videoReceived = true;
+                                                        logDebug(`已接收 ${report.bytesReceived} 字節視頻數據`);
+                                                    }
+                                                });
+                                                if (!videoReceived) {
+                                                    logDebug('警告：未檢測到視頻數據接收');
+                                                }
+                                            }).catch(err => {
+                                                logDebug(`獲取統計數據失敗: ${err}`);
+                                            });
+                                        } else {
+                                            clearInterval(statsInterval);
+                                        }
+                                    }, 5000); // 每5秒檢查一次
+                                } else {
+                                    logDebug('警告：收到的流沒有視頻軌道');
+                                    errorMsg.textContent = '視頻流無效，請檢查手機相機是否正常工作';
                                 }
                             });
-                            if (!videoReceived) {
-                                logDebug('警告：未檢測到視頻數據接收');
-                            }
-                        });
+                            
+                            // 重要修正：監聽流添加事件
+                            currentCall.peerConnection.ontrack = (event) => {
+                                logDebug(`檢測到新軌道添加: ${event.track.kind}, ID=${event.track.id}`);
+                                
+                                // 某些情況下，stream事件可能未觸發，這裡添加額外處理
+                                if (!remoteVideo.srcObject && event.streams && event.streams[0]) {
+                                    logDebug('通過ontrack事件接收到流');
+                                    remoteVideo.srcObject = event.streams[0];
+                                    clearTimeout(timeout);
+                                    updateConnectionStatus('connected', '已連接 (通過ontrack)');
+                                    updateButtonStates();
+                                    
+                                    // 啟動統計監控
+                                    if (!statsInterval) {
+                                        statsInterval = setInterval(() => {
+                                            if (currentCall && currentCall.peerConnection) {
+                                                currentCall.peerConnection.getStats(null).then(stats => {
+                                                    let videoReceived = false;
+                                                    stats.forEach(report => {
+                                                        if (report.type === 'inbound-rtp' && report.kind === 'video') {
+                                                            videoReceived = true;
+                                                            logDebug(`已接收 ${report.bytesReceived} 字節視頻數據`);
+                                                        }
+                                                    });
+                                                    if (!videoReceived) {
+                                                        logDebug('警告：未檢測到視頻數據接收');
+                                                    }
+                                                }).catch(err => {
+                                                    logDebug(`獲取統計數據失敗: ${err}`);
+                                                });
+                                            } else {
+                                                clearInterval(statsInterval);
+                                            }
+                                        }, 5000);
+                                    }
+                                }
+                            };
+                            
+                            currentCall.peerConnection.oniceconnectionstatechange = () => {
+                                const state = currentCall.peerConnection.iceConnectionState;
+                                logDebug(`ICE狀態變更: ${state}`);
+                                if (state === 'failed' || state === 'disconnected') {
+                                    updateConnectionStatus('disconnected', 'ICE連接失敗');
+                                    errorMsg.textContent = 'ICE連接失敗，請嘗試重新連接或檢查網絡';
+                                }
+                            };
+                            
+                            currentCall.peerConnection.onconnectionstatechange = () => {
+                                logDebug(`連接狀態變更: ${currentCall.peerConnection.connectionState}`);
+                            };
+                            
+                            currentCall.on('error', (err) => {
+                                logDebug(`通話錯誤: ${err}`);
+                                errorMsg.textContent = `通話錯誤: ${err}`;
+                                updateConnectionStatus('disconnected', '連接錯誤');
+                                if (statsInterval) clearInterval(statsInterval);
+                            });
+                            
+                            currentCall.on('close', () => {
+                                logDebug('通話已關閉');
+                                remoteVideo.srcObject = null;
+                                updateConnectionStatus('disconnected', '連接已關閉');
+                                updateButtonStates();
+                                if (statsInterval) clearInterval(statsInterval);
+                            });
+                        }
+                        
+                        setupCallListeners();
+                    });
+                    
+                    peer.on('error', (err) => {
+                        errorMsg.textContent = `連接錯誤: ${err.type}`;
+                        logDebug(`PeerJS錯誤: ${err.type}`);
+                        updateConnectionStatus('disconnected', '連接錯誤');
+                        if (err.type === 'peer-unavailable') {
+                            errorMsg.textContent = '找不到該房間ID，請確認是否正確或手機端是否已開始廣播';
+                        }
+                    });
+                    
+                    peer.on('disconnected', () => {
+                        logDebug('與PeerJS服務器斷開，嘗試重連');
+                        updateConnectionStatus('connecting', '正在重連...');
+                        peer.reconnect();
+                    });
+                    
+                    updateButtonStates();
+                });
+                
+                leaveRoomBtn.addEventListener('click', () => {
+                    if (statsInterval) {
+                        clearInterval(statsInterval);
+                        statsInterval = null;
                     }
-                }, 5000); // 每5秒檢查一次
-            } else {
-                logDebug('警告：收到的流沒有視頻軌道');
-                errorMsg.textContent = '視頻流無效，請檢查手機相機是否正常工作';
+                    
+                    if (currentCall) {
+                        currentCall.close();
+                        currentCall = null;
+                    }
+                    
+                    if (peer) {
+                        peer.destroy();
+                        peer = null;
+                    }
+                    
+                    remoteVideo.srcObject = null;
+                    logDebug('已斷開所有連接');
+                    updateConnectionStatus('disconnected', '已斷開連接');
+                    updateButtonStates();
+                });
             }
         });
-        
-        // 重要修正：監聽流添加事件
-        currentCall.peerConnection.ontrack = (event) => {
-            logDebug(`檢測到新軌道添加: ${event.track.kind}, ID=${event.track.id}`);
-            
-            // 某些情況下，stream事件可能未觸發，這裡添加額外處理
-            if (!remoteVideo.srcObject && event.streams && event.streams[0]) {
-                logDebug('通過ontrack事件接收到流');
-                remoteVideo.srcObject = event.streams[0];
-                clearTimeout(timeout);
-                updateConnectionStatus('connected', '已連接 (通過ontrack)');
-                updateButtonStates();
-            }
-        };
-        
-        currentCall.peerConnection.oniceconnectionstatechange = () => {
-            const state = currentCall.peerConnection.iceConnectionState;
-            logDebug(`ICE狀態變更: ${state}`);
-            if (state === 'failed' || state === 'disconnected') {
-                updateConnectionStatus('disconnected', 'ICE連接失敗');
-                errorMsg.textContent = 'ICE連接失敗，請嘗試重新連接或檢查網絡';
-            }
-        };
-        
-        currentCall.peerConnection.onconnectionstatechange = () => {
-            logDebug(`連接狀態變更: ${currentCall.peerConnection.connectionState}`);
-        };
-        
-        currentCall.on('error', (err) => {
-            logDebug(`通話錯誤: ${err}`);
-            errorMsg.textContent = `通話錯誤: ${err}`;
-            updateConnectionStatus('disconnected', '連接錯誤');
-        });
-        
-        currentCall.on('close', () => {
-            logDebug('通話已關閉');
-            remoteVideo.srcObject = null;
-            updateConnectionStatus('disconnected', '連接已關閉');
-            updateButtonStates();
-        });
-    }
-    
-    setupCallListeners();
-});
+    </script>
+</body>
+</html>
