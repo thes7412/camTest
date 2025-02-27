@@ -1,0 +1,381 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>手機相機遠端查看</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 0;
+            padding: 20px;
+            text-align: center;
+        }
+        
+        .container {
+            max-width: 800px;
+            margin: 0 auto;
+        }
+        
+        #localVideo {
+            width: 100%;
+            max-width: 640px;
+            background-color: #000;
+            border-radius: 8px;
+        }
+        
+        .control-panel {
+            margin-top: 20px;
+        }
+        
+        button {
+            padding: 10px 20px;
+            background-color: #4CAF50;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            margin: 5px;
+            font-size: 16px;
+        }
+        
+        button:hover {
+            background-color: #45a049;
+        }
+        
+        button:disabled {
+            background-color: #cccccc;
+            cursor: not-allowed;
+        }
+        
+        .room-info {
+            margin: 20px 0;
+            padding: 10px;
+            background-color: #f1f1f1;
+            border-radius: 4px;
+        }
+        
+        .device-type {
+            font-weight: bold;
+            margin-bottom: 10px;
+        }
+        
+        #roomId {
+            font-weight: bold;
+            color: #4CAF50;
+        }
+        
+        #errorMsg {
+            color: red;
+            margin-top: 10px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>手機相機遠端查看系統</h1>
+        
+        <div class="device-type" id="deviceType">正在檢測裝置類型...</div>
+        
+        <div id="mobileControls" style="display: none;">
+            <h2>手機端 (攝影機來源)</h2>
+            <div class="room-info">
+                房間ID: <span id="roomId">尚未生成</span>
+                <button id="copyRoomId">複製房間ID</button>
+            </div>
+            <video id="localVideo" autoplay playsinline muted></video>
+            <div class="control-panel">
+                <button id="startCamera">開啟相機</button>
+                <button id="stopCamera" disabled>關閉相機</button>
+                <button id="switchCamera">切換相機</button>
+                <button id="startBroadcast" disabled>開始廣播</button>
+                <button id="stopBroadcast" disabled>停止廣播</button>
+            </div>
+        </div>
+        
+        <div id="desktopControls" style="display: none;">
+            <h2>電腦端 (接收端)</h2>
+            <div class="room-info">
+                <input type="text" id="joinRoomId" placeholder="輸入房間ID">
+                <button id="joinRoom">連接到手機</button>
+                <button id="leaveRoom" disabled>斷開連接</button>
+            </div>
+            <video id="remoteVideo" autoplay playsinline></video>
+        </div>
+        
+        <div id="errorMsg"></div>
+    </div>
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.6.0/socket.io.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/peerjs/1.4.7/peerjs.min.js"></script>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            // 檢測裝置類型
+            const isMobile = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
+            const deviceTypeEl = document.getElementById('deviceType');
+            const mobileControls = document.getElementById('mobileControls');
+            const desktopControls = document.getElementById('desktopControls');
+            const errorMsg = document.getElementById('errorMsg');
+            
+            // 設定適合的介面
+            if (isMobile) {
+                deviceTypeEl.textContent = '當前裝置: 手機端 (相機來源)';
+                mobileControls.style.display = 'block';
+                setupMobileMode();
+            } else {
+                deviceTypeEl.textContent = '當前裝置: 電腦端 (接收端)';
+                desktopControls.style.display = 'block';
+                setupDesktopMode();
+            }
+            
+            // 手機端設定
+            function setupMobileMode() {
+                const localVideo = document.getElementById('localVideo');
+                const startCameraBtn = document.getElementById('startCamera');
+                const stopCameraBtn = document.getElementById('stopCamera');
+                const switchCameraBtn = document.getElementById('switchCamera');
+                const startBroadcastBtn = document.getElementById('startBroadcast');
+                const stopBroadcastBtn = document.getElementById('stopBroadcast');
+                const roomIdDisplay = document.getElementById('roomId');
+                const copyRoomIdBtn = document.getElementById('copyRoomId');
+                
+                let stream = null;
+                let peer = null;
+                let currentRoomId = null;
+                let currentCameraFacing = 'user'; // 默認前置攝像頭
+                
+                // 開啟相機
+                startCameraBtn.addEventListener('click', async () => {
+                    try {
+                        const constraints = {
+                            video: {
+                                facingMode: currentCameraFacing,
+                                width: { ideal: 1280 },
+                                height: { ideal: 720 }
+                            },
+                            audio: false
+                        };
+                        
+                        stream = await navigator.mediaDevices.getUserMedia(constraints);
+                        localVideo.srcObject = stream;
+                        
+                        startCameraBtn.disabled = true;
+                        stopCameraBtn.disabled = false;
+                        switchCameraBtn.disabled = false;
+                        startBroadcastBtn.disabled = false;
+                        
+                        // 生成隨機房間ID
+                        currentRoomId = Math.random().toString(36).substring(2, 10);
+                        roomIdDisplay.textContent = currentRoomId;
+                        
+                    } catch (err) {
+                        errorMsg.textContent = `攝像頭啟動失敗: ${err.message}`;
+                        console.error('攝像頭啟動失敗:', err);
+                    }
+                });
+                
+                // 關閉相機
+                stopCameraBtn.addEventListener('click', () => {
+                    if (stream) {
+                        stream.getTracks().forEach(track => track.stop());
+                        localVideo.srcObject = null;
+                        stream = null;
+                    }
+                    
+                    startCameraBtn.disabled = false;
+                    stopCameraBtn.disabled = true;
+                    switchCameraBtn.disabled = true;
+                    startBroadcastBtn.disabled = true;
+                    stopBroadcastBtn.disabled = true;
+                    
+                    if (peer) {
+                        peer.destroy();
+                        peer = null;
+                    }
+                });
+                
+                // 切換相機
+                switchCameraBtn.addEventListener('click', async () => {
+                    if (stream) {
+                        stream.getTracks().forEach(track => track.stop());
+                    }
+                    
+                    try {
+                        currentCameraFacing = currentCameraFacing === 'user' ? 'environment' : 'user';
+                        const constraints = {
+                            video: {
+                                facingMode: currentCameraFacing,
+                                width: { ideal: 1280 },
+                                height: { ideal: 720 }
+                            },
+                            audio: false
+                        };
+                        
+                        stream = await navigator.mediaDevices.getUserMedia(constraints);
+                        localVideo.srcObject = stream;
+                        
+                        if (peer && peer.connections && Object.keys(peer.connections).length > 0) {
+                            // 更新所有連接的視頻流
+                            Object.values(peer.connections).forEach(conns => {
+                                conns.forEach(conn => {
+                                    if (conn.peerConnection) {
+                                        const senders = conn.peerConnection.getSenders();
+                                        const videoTrack = stream.getVideoTracks()[0];
+                                        const videoSender = senders.find(sender => sender.track && sender.track.kind === 'video');
+                                        if (videoSender && videoTrack) {
+                                            videoSender.replaceTrack(videoTrack);
+                                        }
+                                    }
+                                });
+                            });
+                        }
+                        
+                    } catch (err) {
+                        errorMsg.textContent = `切換相機失敗: ${err.message}`;
+                        console.error('切換相機失敗:', err);
+                    }
+                });
+                
+                // 開始廣播
+                startBroadcastBtn.addEventListener('click', () => {
+                    if (!stream) {
+                        errorMsg.textContent = '請先開啟相機';
+                        return;
+                    }
+                    
+                    if (!currentRoomId) {
+                        errorMsg.textContent = '無法生成房間ID';
+                        return;
+                    }
+                    
+                    // 初始化 PeerJS
+                    peer = new Peer(currentRoomId, {
+                        host: 'peerjs-server.herokuapp.com',
+                        secure: true,
+                        port: 443,
+                        debug: 3
+                    });
+                    
+                    peer.on('open', (id) => {
+                        console.log('連接至PeerJS伺服器，ID:', id);
+                        startBroadcastBtn.disabled = true;
+                        stopBroadcastBtn.disabled = false;
+                    });
+                    
+                    peer.on('call', (call) => {
+                        console.log('收到來電...');
+                        call.answer(stream);
+                    });
+                    
+                    peer.on('error', (err) => {
+                        console.error('PeerJS錯誤:', err);
+                        errorMsg.textContent = `連接錯誤: ${err.type}`;
+                    });
+                });
+                
+                // 停止廣播
+                stopBroadcastBtn.addEventListener('click', () => {
+                    if (peer) {
+                        peer.destroy();
+                        peer = null;
+                    }
+                    
+                    startBroadcastBtn.disabled = false;
+                    stopBroadcastBtn.disabled = true;
+                });
+                
+                // 複製房間ID
+                copyRoomIdBtn.addEventListener('click', () => {
+                    if (currentRoomId) {
+                        navigator.clipboard.writeText(currentRoomId)
+                            .then(() => {
+                                alert('房間ID已複製到剪貼簿');
+                            })
+                            .catch(err => {
+                                console.error('複製失敗:', err);
+                                alert('複製失敗，請手動複製: ' + currentRoomId);
+                            });
+                    }
+                });
+            }
+            
+            // 電腦端設定
+            function setupDesktopMode() {
+                const joinRoomIdInput = document.getElementById('joinRoomId');
+                const joinRoomBtn = document.getElementById('joinRoom');
+                const leaveRoomBtn = document.getElementById('leaveRoom');
+                const remoteVideo = document.getElementById('remoteVideo');
+                
+                let peer = null;
+                let currentCall = null;
+                
+                // 連接到手機
+                joinRoomBtn.addEventListener('click', () => {
+                    const roomId = joinRoomIdInput.value.trim();
+                    if (!roomId) {
+                        errorMsg.textContent = '請輸入房間ID';
+                        return;
+                    }
+                    
+                    // 初始化 PeerJS
+                    peer = new Peer({
+                        host: 'peerjs-server.herokuapp.com',
+                        secure: true,
+                        port: 443,
+                        debug: 3
+                    });
+                    
+                    peer.on('open', (id) => {
+                        console.log('連接至PeerJS伺服器，ID:', id);
+                        
+                        // 呼叫手機端
+                        currentCall = peer.call(roomId, new MediaStream());
+                        
+                        currentCall.on('stream', (remoteStream) => {
+                            console.log('收到遠端視頻流');
+                            remoteVideo.srcObject = remoteStream;
+                            joinRoomBtn.disabled = true;
+                            leaveRoomBtn.disabled = false;
+                        });
+                        
+                        currentCall.on('error', (err) => {
+                            console.error('通話錯誤:', err);
+                            errorMsg.textContent = `通話錯誤: ${err}`;
+                        });
+                        
+                        currentCall.on('close', () => {
+                            console.log('通話已關閉');
+                            remoteVideo.srcObject = null;
+                            joinRoomBtn.disabled = false;
+                            leaveRoomBtn.disabled = true;
+                        });
+                    });
+                    
+                    peer.on('error', (err) => {
+                        console.error('PeerJS錯誤:', err);
+                        errorMsg.textContent = `連接錯誤: ${err.type}`;
+                    });
+                });
+                
+                // 斷開連接
+                leaveRoomBtn.addEventListener('click', () => {
+                    if (currentCall) {
+                        currentCall.close();
+                        currentCall = null;
+                    }
+                    
+                    if (peer) {
+                        peer.destroy();
+                        peer = null;
+                    }
+                    
+                    remoteVideo.srcObject = null;
+                    joinRoomBtn.disabled = false;
+                    leaveRoomBtn.disabled = true;
+                });
+            }
+        });
+    </script>
+</body>
+</html>
